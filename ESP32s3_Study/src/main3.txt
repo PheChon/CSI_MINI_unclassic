@@ -1,0 +1,87 @@
+#include <stdio.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+// #include "esp_timer.h" // ไม่จำเป็นต้องใช้แล้ว
+
+// -- กำหนดค่า Wi-Fi --
+#define WIFI_SSID           "Error404_2.4G"
+#define WIFI_PASS           "URL/ee64"
+
+// -- กำหนดค่าสำหรับ Log-Distance Path Loss Model --
+#define CAL_RSSI_AT_1M      -45.0
+#define PATH_LOSS_N         2.5
+
+static const char *TAG = "DISTANCE_STREAMER_APP";
+static bool wifi_connected = false;
+
+// --- ฟังก์ชันคำนวณระยะทางจาก RSSI ---
+float estimate_distance_from_rssi(int rssi) {
+    return pow(10, (CAL_RSSI_AT_1M - (float)rssi) / (10.0 * PATH_LOSS_N));
+}
+
+// --- Task สำหรับส่งค่าระยะทางต่อเนื่อง ---
+void distance_stream_task(void *pvParameters) {
+    while(1) {
+        if (wifi_connected) {
+            wifi_ap_record_t ap_info;
+            if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+                // คำนวณระยะทาง
+                float distance = estimate_distance_from_rssi(ap_info.rssi);
+                
+                // ## ปรับแก้ ##
+                // เปลี่ยนรูปแบบการส่งข้อมูลให้ตรงกับที่ Python ต้องการ
+                printf("Distance:%.2f\n", distance);
+            }
+        }
+        // ปรับ Delay ให้เหมาะสมกับการแสดงผล (5 ครั้งต่อวินาที)
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}
+
+// --- Event Handler (เหมือนเดิม) ---
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data) {
+    if (event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_connected = false;
+        ESP_LOGI(TAG, "Wi-Fi disconnected. Retrying...");
+        esp_wifi_connect();
+    } else if (event_id == IP_EVENT_STA_GOT_IP) {
+        wifi_connected = true;
+        ESP_LOGI(TAG, "Wi-Fi connected successfully!");
+    }
+}
+
+void app_main(void)
+{
+    // --- (ส่วน khởi tạo ระบบเหมือนเดิม) ---
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+      ESP_ERROR_CHECK(nvs_flash_erase());
+      ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+    
+    // ตั้งค่าและเริ่ม Wi-Fi
+    wifi_config_t wifi_config = { .sta = { .ssid = WIFI_SSID, .password = WIFI_PASS } };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    // สร้าง Task สำหรับส่งค่าระยะทาง
+    xTaskCreate(&distance_stream_task, "distance_stream_task", 2048, NULL, 5, NULL);
+}

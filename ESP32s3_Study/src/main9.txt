@@ -1,0 +1,84 @@
+#include <stdio.h>
+#include <string.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_wifi.h"
+#include "esp_now.h"
+#include "esp_log.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+
+static const char *TAG = "RECEIVER_NODE";
+
+// MAC Address ของ Transmitter (Gateway Node) ที่จะคอยดักฟัง
+static uint8_t gateway_mac_addr[] = {0xF0, 0x08, 0xD1, 0xD1, 0xB3, 0xBC};
+
+// ค่าที่ได้จากการ Calibration
+#define A_RSSI -45.0
+#define N_PATH_LOSS 2.5
+
+// Struct สำหรับส่งข้อมูลกลับ (เพิ่ม RSSI เข้าไปด้วย)
+typedef struct {
+    int rssi;
+    double distance;
+} response_data_t;
+
+// ฟังก์ชันแปลง RSSI เป็นระยะทาง
+double rssi_to_distance(int rssi) {
+    double exponent = (A_RSSI - (double)rssi) / (10.0 * N_PATH_LOSS);
+    return pow(10.0, exponent);
+}
+
+// ฟังก์ชัน Callback ที่ทำงานเมื่อดักฟัง Wi-Fi Packet ได้
+static void wifi_sniffer_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+    if (type == WIFI_PKT_MISC || buf == NULL) return;
+
+    const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
+    const uint8_t *sender_mac = pkt->payload + 10; // MAC ของผู้ส่ง
+
+    if (memcmp(sender_mac, gateway_mac_addr, 6) == 0) {
+        int rssi = pkt->rx_ctrl.rssi;
+        double distance = rssi_to_distance(rssi);
+
+        // --- แก้ไขบรรทัดนี้ ---
+        // พิมพ์ทั้ง RSSI และ Distance ออกทาง Serial
+        printf("RSSI:%d,Distance:%.2f\n", rssi, distance);
+        // --------------------
+
+        // ส่งข้อมูลกลับไปให้ Gateway
+        response_data_t response;
+        response.rssi = rssi;
+        response.distance = distance;
+        esp_now_send(gateway_mac_addr, (uint8_t *)&response, sizeof(response));
+    }
+}
+
+void app_main(void) {
+    nvs_flash_init();
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    
+    esp_wifi_start();
+    esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+
+    esp_wifi_set_promiscuous(true);
+    esp_wifi_set_promiscuous_rx_cb(wifi_sniffer_cb);
+
+    esp_now_init();
+
+    esp_now_peer_info_t peer_info = {};
+    memcpy(peer_info.peer_addr, gateway_mac_addr, 6);
+    peer_info.channel = 1;
+    peer_info.encrypt = false;
+    ESP_ERROR_CHECK(esp_now_add_peer(&peer_info));
+
+    ESP_LOGI(TAG, "Receiver Node Initialized. Sniffing for Gateway packets.");
+}
